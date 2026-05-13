@@ -21,9 +21,11 @@ The continuous sender. Reads the labels the Python worker stamps onto drafts, se
    ```js
    const TRIGGER_MINUTES = 5;     // cadence
    const SIGNATURE       = "";    // appended before send
-   const GIF_URLS        = [];    // public URLs, one is picked at random
-                                  // whenever a body contains [[gif_token]]
    ```
+   Gif URLs are now per-prospect: every body token looks like
+   `[[gif:<url>]]` (the worker bakes `{{gif_url}}` from your CSV into that
+   shape). Sender fetches the URL on send and CID-inlines it. Empty URL
+   or failed fetch → the token is silently dropped.
 5. From the Apps Script editor, select **`installTrigger`** in the function dropdown and click **Run**. Approve the scopes prompt. Done — a 5-minute time-driven trigger is now installed.
 
 ## Day-to-day

@@ -27,8 +27,10 @@
 const TRIGGER_MINUTES = 5;     // cadence
 const LABEL_ROOT      = "seq"; // must match the worker's labelPrefix's first segment
 const SIGNATURE       = "";    // appended after the body, before send. Plain text.
-const GIF_URLS        = [];    // public URLs; one gets picked at random when body has [[gif_token]]
 const SCAN_LIMIT      = 100;   // max threads pulled per label per tick
+// Gif inlining: bodies contain `[[gif:<url>]]` tokens (the worker bakes
+// `{{gif_url}}` from your CSV into that shape). The sender fetches each URL,
+// inlines as CID, and replaces the token with <img src="cid:..."> on send.
 // ────────────────────────────────────────────────────────────────────────────
 
 function installTrigger() {
@@ -278,25 +280,33 @@ function listCleanupCandidates(ctx) {
 }
 
 // ─── gif inlining ───────────────────────────────────────────────────────────
+//
+// Bodies contain one or more `[[gif:<url>]]` tokens (the worker substitutes
+// {{gif_url}} per prospect). Each one is fetched, attached as inline image
+// with its own CID, and the token is replaced with <img src="cid:...">.
+// Empty URLs and fetch failures are stripped silently — better than leaking
+// `[[gif:]]` text into the email.
 function buildHtmlWithGif(body) {
   let html = textToHtml(body);
   const inlineImages = {};
-  if (html.indexOf("[[gif_token]]") === -1) return { htmlBody: html, inlineImages: inlineImages };
+  const tokenRe = /\[\[gif:([^\]]*)\]\]/g;
+  if (!tokenRe.test(html)) return { htmlBody: html, inlineImages: inlineImages };
+  tokenRe.lastIndex = 0;
 
-  if (GIF_URLS.length === 0) {
-    html = html.replace(/\[\[gif_token\]\]/g, "");
-    return { htmlBody: html, inlineImages: inlineImages };
-  }
-  try {
-    const url = GIF_URLS[Math.floor(Math.random() * GIF_URLS.length)];
-    const blob = UrlFetchApp.fetch(url).getBlob().setName("anim.gif");
-    const cid = "gif" + Date.now();
-    html = html.replace(/\[\[gif_token\]\]/g, '<img src="cid:' + cid + '" alt="">');
-    inlineImages[cid] = blob;
-  } catch (e) {
-    Logger.log("gif inline failed: " + e);
-    html = html.replace(/\[\[gif_token\]\]/g, "");
-  }
+  let i = 0;
+  html = html.replace(tokenRe, function (_match, rawUrl) {
+    const url = rawUrl.trim();
+    if (!url) return "";
+    try {
+      const blob = UrlFetchApp.fetch(url).getBlob().setName("anim-" + i + ".gif");
+      const cid = "gif" + Date.now() + "_" + (i++);
+      inlineImages[cid] = blob;
+      return '<img src="cid:' + cid + '" alt="">';
+    } catch (e) {
+      Logger.log("gif fetch failed for " + url + ": " + e);
+      return "";
+    }
+  });
   return { htmlBody: html, inlineImages: inlineImages };
 }
 
@@ -374,6 +384,7 @@ function textToHtml(text) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-  // [[gif_token]] is preserved verbatim and swapped after we decide CID vs strip.
+  // [[gif:<url>]] tokens are preserved verbatim; buildHtmlWithGif rewrites
+  // them after escaping.
   return esc.replace(/\n/g, "<br>");
 }

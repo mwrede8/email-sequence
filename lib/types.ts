@@ -39,4 +39,12 @@ export type Manifest = {
   }>;
 };
 
-export const GIF_TOKEN = "[[gif_token]]";
+// Token inserted by the "Insert gif" button. After the worker substitutes
+// {{gif_url}} from the CSV, the resulting draft body contains
+// `[[gif:https://example.com/anim.gif]]`. The Apps Script sender matches
+// `\[\[gif:(.+?)\]\]`, fetches that URL, and CID-inlines it on send.
+//
+// If you want multiple gif slots in one sequence, change the variable name
+// (e.g. `[[gif:{{gif_url_1}}]]`, `[[gif:{{gif_url_2}}]]`) and add matching
+// CSV columns.
+export const GIF_TOKEN = "[[gif:{{gif_url}}]]";

@@ -465,9 +465,9 @@ function StepCard({
         <button
           onClick={() => insertAtCursor(GIF_TOKEN)}
           className="text-xs px-2 py-1 rounded border border-purple-300 bg-purple-50 text-purple-900 hover:bg-purple-100"
-          title="Inserts [[gif_token]] at the cursor; Apps Script CID-inlines a gif when sending."
+          title="Inserts [[gif:{{gif_url}}]] at the cursor. The worker substitutes {{gif_url}} from your CSV per prospect; Apps Script CID-inlines that URL on send."
         >
-          + Insert gif token
+          + Insert gif placeholder
         </button>
         <span className="text-xs text-neutral-400 font-mono">{GIF_TOKEN}</span>
         <span className="text-xs text-neutral-500 ml-auto">
