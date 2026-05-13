@@ -9,6 +9,7 @@ import {
 } from "@/lib/storage";
 import type { Sequence, Step, SendMode } from "@/lib/types";
 import { GIF_TOKEN } from "@/lib/types";
+import CsvColumnsHint from "@/app/_components/CsvColumnsHint";
 
 function emptySequence(): Sequence {
   return {
@@ -263,24 +264,11 @@ function SequenceEditor({
       </div>
 
       {variables.length > 0 && (
-        <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
-          <div className="font-medium">
-            CSV will need these columns ({variables.length}):
-          </div>
-          <div className="mt-1 flex flex-wrap gap-1">
-            {variables.map((v) => (
-              <code
-                key={v}
-                className="font-mono bg-white px-1.5 py-0.5 rounded border border-blue-200"
-              >
-                {v}
-              </code>
-            ))}
-            <code className="font-mono bg-white px-1.5 py-0.5 rounded border border-blue-200">
-              email
-            </code>
-          </div>
-        </div>
+        <CsvColumnsHint
+          variables={variables}
+          sequenceName={sequence.name}
+          steps={sequence.steps}
+        />
       )}
 
       <ol className="space-y-3">

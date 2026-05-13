@@ -8,6 +8,7 @@ import {
   renderTemplate,
 } from "@/lib/storage";
 import type { Manifest, Sequence } from "@/lib/types";
+import CsvColumnsHint from "@/app/_components/CsvColumnsHint";
 
 type ParsedCsv = {
   headers: string[];
@@ -189,20 +190,12 @@ export default function CampaignsPage() {
         </div>
       </section>
 
-      {requiredVars.length > 0 && (
-        <section className="rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
-          <div className="font-medium">CSV must include these columns:</div>
-          <div className="mt-1 flex flex-wrap gap-1">
-            {["email", ...requiredVars].map((v) => (
-              <code
-                key={v}
-                className="font-mono bg-white px-1.5 py-0.5 rounded border border-blue-200"
-              >
-                {v}
-              </code>
-            ))}
-          </div>
-        </section>
+      {requiredVars.length > 0 && sequence && (
+        <CsvColumnsHint
+          variables={requiredVars}
+          sequenceName={sequence.name}
+          steps={sequence.steps}
+        />
       )}
 
       <section className="space-y-2">
