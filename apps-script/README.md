@@ -1,36 +1,46 @@
 # apps-script/
 
-Cron-driven sender. Promotes labeled drafts → sent on the schedule the worker baked into label names.
+The continuous sender. Reads the labels the Python worker stamps onto drafts, sends what's due, and deletes drafts the recipient no longer needs.
 
-## Install
+## What it does each tick
 
-1. https://script.google.com → **New project**.
-2. Project settings → **Show "appsscript.json" manifest file in editor**.
+1. Finds every label named `<prefix>/step-<N>/send-after-<YYYY-MM-DDTHH-MM>` whose timestamp has passed.
+2. For each due draft on that label:
+   - **New-thread step** → sends as a fresh email, swaps in a random CID-inlined gif for `[[gif_token]]`, deletes the draft, labels the sent thread.
+   - **Reply step** → finds the parent step's sent thread, replies on it, deletes the standalone draft.
+3. Walks every `<prefix>/to/<email>` label: if that prospect replied to *anything* under this prefix, every pending draft to that prospect gets deleted. They never hear from you again on this sequence.
+
+## Setup (3 minutes, once)
+
+1. https://script.google.com → **New project**, name it `email-sequencer`.
+2. **Settings** → toggle **Show "appsscript.json" manifest file in editor**.
 3. Replace the editor contents with the matching files in this folder:
-   - `appsscript.json` (scopes)
-   - `sender.gs` (logic)
-4. **Triggers** (clock icon) → add trigger:
-   - Function: `tick`
-   - Event source: Time-driven
-   - Type of time-based trigger: **Minutes timer**
-   - Every **5 minutes** (or 15 — whichever cadence you want).
-5. Run `tick` once manually to grant scopes.
+   - `appsscript.json` (scopes — paste over the existing manifest)
+   - `sender.gs` (logic — rename `Code.gs` if you like)
+4. (Optional) Edit the config block at the top of `sender.gs`:
+   ```js
+   const TRIGGER_MINUTES = 5;     // cadence
+   const SIGNATURE       = "";    // appended before send
+   const GIF_URLS        = [];    // public URLs, one is picked at random
+                                  // whenever a body contains [[gif_token]]
+   ```
+5. From the Apps Script editor, select **`installTrigger`** in the function dropdown and click **Run**. Approve the scopes prompt. Done — a 5-minute time-driven trigger is now installed.
 
-## Editing config
+## Day-to-day
 
-Open `sender.gs`. The top of the file has `LABEL_ROOTS`, `GIF_URLS`, and
-`SIGNATURE`. Add gif URLs you want inlined whenever a draft contains
-`[[gif_token]]`. They get fetched via `UrlFetchApp`, so they must be
-publicly reachable.
+- **`tick`** — what the trigger calls. You shouldn't need to run it manually.
+- **`status`** — log dump: what's due right now, and which pending drafts will be cleaned because the prospect replied. Run this any time to peek without touching anything.
+- **`uninstallTrigger`** — pauses the loop. Run again to re-arm with `installTrigger`.
 
-## Label scheme expected from the worker
+## Label scheme the worker writes
 
 ```
-seq/<sequence-id>/step-<N>/send-after-<YYYY-MM-DDTHH-MM>
-seq/<sequence-id>/to/<email>
+seq/<sequence-id>/step-<N>/send-after-<YYYY-MM-DDTHH-MM>   ← pending
+seq/<sequence-id>/step-<N>/sent-at-<YYYY-MM-DDTHH-MM>      ← after send (added by this script)
+seq/<sequence-id>/step-<N>                                  ← step marker
+seq/<sequence-id>/to/<email>                                ← recipient grouping
 seq/<sequence-id>/mode-<new|reply>
-seq/<sequence-id>/reply-to-step-<M>   (only when mode=reply)
+seq/<sequence-id>/reply-to-step-<M>                         ← reply steps only
 ```
 
-After a send, the `send-after-*` label is replaced with
-`seq/<sequence-id>/step-<N>/sent-at-<YYYY-MM-DDTHH-MM>`.
+Change `LABEL_ROOT` at the top of `sender.gs` if you want to use something other than `seq` (must match the `labelPrefix` you set per sequence in the web UI).

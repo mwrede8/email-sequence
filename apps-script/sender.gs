@@ -1,200 +1,361 @@
 /**
- * sender.gs — promote labeled email-sequencer drafts to Sent on schedule.
+ * sender.gs — continuously promote email-sequencer drafts, clean up
+ * drafts no longer needed.
  *
- * Setup:
- *   1. script.google.com → New project, paste this file in.
- *   2. Settings → Show appsscript.json. Add gmail/drive scopes (see README).
- *   3. Triggers → add a time-driven trigger calling `tick`, every 5 or 15 min.
- *   4. (Optional) Drop one or more gif URLs into the `GIF_URLS` array below.
- *   5. (Optional) Put your signature text in `SIGNATURE`.
+ * Setup (3 minutes, one time):
+ *   1. https://script.google.com → New project, name it "email-sequencer".
+ *   2. Settings → toggle "Show 'appsscript.json' manifest in editor".
+ *   3. Paste this file as Code.gs and the matching appsscript.json into the editor.
+ *   4. Drop a few public gif URLs into GIF_URLS below if you want gif inlining.
+ *   5. Run `installTrigger` once from the Apps Script editor (it'll prompt for
+ *      scopes). After that, it runs itself every TRIGGER_MINUTES minutes
+ *      forever.
+ *   6. (Optional) Run `status` any time to see what's pending and what would
+ *      be cleaned up on the next tick.
  *
- * Each tick:
- *   - Scans labels matching `*/step-N/send-after-<iso>`.
- *   - For every draft due (ISO <= now), CID-inlines a random gif in place of
- *     [[gif_token]], threads replies under the prior step's sent message, and
- *     sends.
- *   - On success, removes `send-after-*` and adds `sent-at-<iso>`.
+ * What each tick does:
+ *   - Promotes drafts whose label `<prefix>/step-N/send-after-<iso>` is due:
+ *       · new-thread steps → send a fresh email (CID-inlines gif if present).
+ *       · reply steps     → reply on the parent step's sent thread, delete
+ *                           the standalone draft.
+ *   - Cleans up: if a prospect replied to *any* thread in this sequence,
+ *     deletes every still-pending draft for that recipient under the same
+ *     prefix. Nothing else should bother them.
  */
 
-// ---- config ----
-const LABEL_ROOTS = ["seq"]; // top-level prefixes the worker uses.
-const GIF_URLS = [
-  // Drop a few public/CDN gif URLs here. They get fetched per send and inlined as CID.
-];
-const SIGNATURE = ""; // optional plain-text signature appended after body.
-const SCAN_LIMIT = 50; // max threads to look at per tick.
-// ---- end config ----
+// ─── config ─────────────────────────────────────────────────────────────────
+const TRIGGER_MINUTES = 5;     // cadence
+const LABEL_ROOT      = "seq"; // must match the worker's labelPrefix's first segment
+const SIGNATURE       = "";    // appended after the body, before send. Plain text.
+const GIF_URLS        = [];    // public URLs; one gets picked at random when body has [[gif_token]]
+const SCAN_LIMIT      = 100;   // max threads pulled per label per tick
+// ────────────────────────────────────────────────────────────────────────────
+
+function installTrigger() {
+  uninstallTrigger();
+  ScriptApp.newTrigger("tick").timeBased().everyMinutes(TRIGGER_MINUTES).create();
+  Logger.log("✓ trigger installed: tick every " + TRIGGER_MINUTES + " minutes");
+}
+
+function uninstallTrigger() {
+  let n = 0;
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === "tick") {
+      ScriptApp.deleteTrigger(t);
+      n++;
+    }
+  });
+  if (n > 0) Logger.log("removed " + n + " existing tick trigger(s)");
+}
 
 function tick() {
-  const now = new Date();
-  const sendAfterRe = /\/step-(\d+)\/send-after-([0-9T:\-]+)$/;
-  const labels = GmailApp.getUserLabels()
-    .filter((l) =>
-      LABEL_ROOTS.some((r) => l.getName() === r || l.getName().startsWith(r + "/"))
-    )
-    .filter((l) => sendAfterRe.test(l.getName()));
+  const ctx = newCtx();
+  const promoted = promoteDueDrafts(ctx);
+  const cleaned  = cleanupRepliedRecipients(ctx);
+  Logger.log("tick: promoted=" + promoted + " cleaned=" + cleaned);
+}
 
-  let promoted = 0;
-  labels.forEach((label) => {
+function status() {
+  const ctx  = newCtx();
+  const due  = listDueDrafts(ctx);
+  const dead = listCleanupCandidates(ctx);
+  Logger.log("DUE NOW (" + due.length + "):");
+  due.forEach(function (d) { Logger.log("  " + d); });
+  Logger.log("CLEANUP CANDIDATES (" + dead.length + "):");
+  dead.forEach(function (d) { Logger.log("  " + d); });
+}
+
+// ─── tick context: cache expensive calls within one run ─────────────────────
+function newCtx() {
+  return {
+    now: new Date(),
+    _drafts: null,
+    _labels: null,
+    getAllDrafts: function () {
+      if (!this._drafts) this._drafts = GmailApp.getDrafts();
+      return this._drafts;
+    },
+    getAllLabels: function () {
+      if (!this._labels) this._labels = GmailApp.getUserLabels();
+      return this._labels;
+    },
+    findDraftOnThread: function (threadId) {
+      const drafts = this.getAllDrafts();
+      for (let i = 0; i < drafts.length; i++) {
+        if (drafts[i].getMessage().getThread().getId() === threadId) return drafts[i];
+      }
+      return null;
+    },
+    forgetDrafts: function () { this._drafts = null; },
+  };
+}
+
+function rootLabelOk(name) {
+  return name === LABEL_ROOT || name.indexOf(LABEL_ROOT + "/") === 0;
+}
+
+// ─── promote ────────────────────────────────────────────────────────────────
+function promoteDueDrafts(ctx) {
+  const sendAfterRe = /^(.+?)\/step-(\d+)\/send-after-(.+)$/;
+  const labels = ctx.getAllLabels().filter(function (l) {
+    return rootLabelOk(l.getName()) && sendAfterRe.test(l.getName());
+  });
+
+  let count = 0;
+  for (let i = 0; i < labels.length; i++) {
+    const label = labels[i];
     const m = label.getName().match(sendAfterRe);
-    if (!m) return;
-    const stepNum = parseInt(m[1], 10);
-    const sendAfter = parseSlugIso(m[2]);
-    if (!sendAfter || sendAfter > now) return;
+    const prefix = m[1];
+    const stepNum = parseInt(m[2], 10);
+    const due = parseSlugIso(m[3]);
+    if (!due || due > ctx.now) continue;
 
     const threads = label.getThreads(0, SCAN_LIMIT);
-    threads.forEach((thread) => {
+    for (let j = 0; j < threads.length; j++) {
       try {
-        if (promoteThread(thread, stepNum, label)) promoted++;
+        if (promoteThread(ctx, threads[j], prefix, stepNum, label)) count++;
       } catch (e) {
-        Logger.log("promote failed: " + e);
+        Logger.log("promote error: " + e + "\n" + (e.stack || ""));
       }
-    });
-  });
-  Logger.log("tick: promoted " + promoted + " drafts");
-}
-
-// "2026-05-20T13-00" → Date
-function parseSlugIso(slug) {
-  const fixed = slug.replace(/^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})$/, "$1:$2:00");
-  const d = new Date(fixed);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-function findRootLabelPrefix(thread) {
-  const labels = thread.getLabels().map((l) => l.getName());
-  // The thread should have a label like "<prefix>/step-N/send-after-..." —
-  // we want "<prefix>".
-  for (const name of labels) {
-    const m = name.match(/^(.+?)\/step-\d+\/send-after-/);
-    if (m) return m[1];
+    }
   }
-  return null;
+  return count;
 }
 
-function promoteThread(thread, stepNum, dueLabel) {
-  // Find the matching draft on this thread.
-  const drafts = GmailApp.getDrafts().filter(
-    (d) => d.getMessage().getThread().getId() === thread.getId()
-  );
-  if (drafts.length === 0) return false;
-  const draft = drafts[0];
+function promoteThread(ctx, thread, prefix, stepNum, dueLabel) {
+  const draft = ctx.findDraftOnThread(thread.getId());
+  if (!draft) return false;
   const draftMsg = draft.getMessage();
 
-  const prefix = findRootLabelPrefix(thread);
-  if (!prefix) return false;
+  const to = draftMsg.getTo() || labelLookup(thread, prefix, "/to/");
+  if (!to) {
+    Logger.log("no recipient on thread " + thread.getId() + " — skipping");
+    return false;
+  }
 
-  const mode = thread.getLabels().some((l) => l.getName() === prefix + "/mode-reply")
-    ? "reply"
-    : "new";
+  // If the recipient already replied to anything in this prefix, drop this
+  // draft and move on (handled more thoroughly by cleanup, but cheap to check).
+  if (recipientReplied(prefix, to)) {
+    Logger.log("skip step " + stepNum + " to " + to + " — already replied");
+    draft.deleteDraft();
+    thread.removeLabel(dueLabel);
+    ctx.forgetDrafts();
+    return false;
+  }
 
-  const to = draftMsg.getTo() || extractToFromLabels(thread, prefix);
+  const isReply = thread.getLabels().some(function (l) {
+    return l.getName() === prefix + "/mode-reply";
+  });
+
   let body = draftMsg.getPlainBody();
   if (SIGNATURE) body = body + "\n\n" + SIGNATURE;
 
-  // CID-inline gif token.
-  let htmlBody = textToHtml(body);
-  const attachments = [];
-  if (htmlBody.includes("[[gif_token]]") && GIF_URLS.length > 0) {
-    try {
-      const url = GIF_URLS[Math.floor(Math.random() * GIF_URLS.length)];
-      const blob = UrlFetchApp.fetch(url).getBlob().setName("anim.gif");
-      const cid = "gif" + Date.now();
-      blob.setContentTypeFromExtension && blob.setContentTypeFromExtension();
-      htmlBody = htmlBody.replace(
-        /\[\[gif_token\]\]/g,
-        '<img src="cid:' + cid + '" alt="">'
-      );
-      attachments.push({ fileName: "anim.gif", mimeType: "image/gif", content: blob.getBytes(), contentId: cid });
-    } catch (e) {
-      Logger.log("gif inline failed: " + e);
-      htmlBody = htmlBody.replace(/\[\[gif_token\]\]/g, "");
-    }
-  } else {
-    htmlBody = htmlBody.replace(/\[\[gif_token\]\]/g, "");
-  }
+  const built = buildHtmlWithGif(body);
 
-  let sentMessage;
-  if (mode === "reply") {
-    const replyToStep = readReplyTargetStep(thread, prefix);
-    const parentThread = findParentSentThread(prefix, to, replyToStep);
-    if (parentThread) {
-      // Re-send on the parent thread.
-      parentThread.reply("", {
-        htmlBody: htmlBody,
-        inlineImages: inlineImagesFromAttachments(attachments),
-      });
-      // Find the message we just added.
-      const all = parentThread.getMessages();
-      sentMessage = all[all.length - 1];
-      // Discard the standalone draft.
-      draft.deleteDraft();
-    } else {
-      // No parent found yet (still pending). Skip this tick.
+  if (isReply) {
+    const parentStep = readReplyTargetStep(thread, prefix);
+    const parent = findParentSentThread(prefix, to, parentStep);
+    if (!parent) {
+      Logger.log("reply step " + stepNum + " to " + to + " — parent step " + parentStep + " not sent yet, will retry");
       return false;
     }
+    parent.reply("", { htmlBody: built.htmlBody, inlineImages: built.inlineImages });
+    draft.deleteDraft();
+    ctx.forgetDrafts();
+
+    swapSendAfterToSentAt(parent, prefix, stepNum, dueLabel);
+    parent.addLabel(ensureLabel(prefix + "/step-" + stepNum));
   } else {
-    // New thread: just send the draft.
-    const opts = {
-      htmlBody: htmlBody,
-      inlineImages: inlineImagesFromAttachments(attachments),
-    };
-    sentMessage = draft.send().getMessages().slice(-1)[0];
-    // draft.send() returns the thread; we just want a reference to mark labels below.
-    if (!sentMessage) sentMessage = draftMsg;
+    const subject = draftMsg.getSubject() || "(no subject)";
+    GmailApp.sendEmail(to, subject, body, {
+      htmlBody: built.htmlBody,
+      inlineImages: built.inlineImages,
+    });
+    draft.deleteDraft();
+    ctx.forgetDrafts();
+
+    // Find the just-sent thread to apply tracking labels.
+    const sent = GmailApp.search(
+      'in:sent to:' + to + ' subject:"' + subject.replace(/"/g, "") + '" newer_than:1d',
+      0, 1,
+    );
+    if (sent.length > 0) {
+      swapSendAfterToSentAt(sent[0], prefix, stepNum, dueLabel);
+      sent[0].addLabel(ensureLabel(prefix + "/to/" + to));
+      sent[0].addLabel(ensureLabel(prefix + "/step-" + stepNum));
+      sent[0].addLabel(ensureLabel(prefix + "/mode-new"));
+    } else {
+      // Couldn't find the sent thread (rare). Still clear the due label off the
+      // original draft thread so we don't try again.
+      thread.removeLabel(dueLabel);
+    }
   }
 
-  // Move the thread: remove the "send-after" label, add a "sent-at" label.
-  const sentAt = isoSlug(new Date());
-  const sentLabelName = prefix + "/step-" + stepNum + "/sent-at-" + sentAt;
-  thread.removeLabel(dueLabel);
-  thread.addLabel(GmailApp.getUserLabelByName(sentLabelName) || GmailApp.createLabel(sentLabelName));
   return true;
 }
 
-function inlineImagesFromAttachments(attachments) {
-  const out = {};
-  attachments.forEach((a) => {
-    if (a.contentId) out[a.contentId] = Utilities.newBlob(a.content, a.mimeType, a.fileName);
+// ─── cleanup: prospect already replied → drop pending drafts to them ────────
+function cleanupRepliedRecipients(ctx) {
+  const toLabelRe = /^(.+?)\/to\/(.+)$/;
+  const labels = ctx.getAllLabels().filter(function (l) {
+    return rootLabelOk(l.getName()) && toLabelRe.test(l.getName());
+  });
+
+  let cleaned = 0;
+  for (let i = 0; i < labels.length; i++) {
+    const label = labels[i];
+    const m = label.getName().match(toLabelRe);
+    const prefix = m[1];
+    const email = m[2];
+
+    if (!recipientReplied(prefix, email)) continue;
+
+    const threads = label.getThreads(0, SCAN_LIMIT);
+    for (let j = 0; j < threads.length; j++) {
+      const thread = threads[j];
+      const hasSendAfter = thread.getLabels().some(function (l) {
+        return /\/send-after-/.test(l.getName());
+      });
+      if (!hasSendAfter) continue;
+
+      const draft = ctx.findDraftOnThread(thread.getId());
+      if (!draft) continue;
+      draft.deleteDraft();
+      ctx.forgetDrafts();
+      // Strip the send-after label so the scanner doesn't churn on it again.
+      thread.getLabels().forEach(function (lbl) {
+        if (/\/send-after-/.test(lbl.getName())) thread.removeLabel(lbl);
+      });
+      cleaned++;
+      Logger.log("cleaned: " + email + " step thread " + thread.getId() + " — recipient replied");
+    }
+  }
+  return cleaned;
+}
+
+function recipientReplied(prefix, email) {
+  // We only count messages FROM the prospect on a thread that has our
+  // /to/<email> label — that filters out unrelated mail.
+  const q = 'from:' + email + ' label:"' + prefix + '/to/' + email + '"';
+  return GmailApp.search(q, 0, 1).length > 0;
+}
+
+// ─── status helpers ─────────────────────────────────────────────────────────
+function listDueDrafts(ctx) {
+  const sendAfterRe = /^(.+?)\/step-(\d+)\/send-after-(.+)$/;
+  const out = [];
+  ctx.getAllLabels().forEach(function (l) {
+    if (!rootLabelOk(l.getName())) return;
+    const m = l.getName().match(sendAfterRe);
+    if (!m) return;
+    const due = parseSlugIso(m[3]);
+    if (!due || due > ctx.now) return;
+    const threads = l.getThreads(0, SCAN_LIMIT);
+    threads.forEach(function (t) {
+      const to = labelLookup(t, m[1], "/to/") || "(unknown)";
+      out.push("step " + m[2] + " to " + to + " (due " + m[3] + ")");
+    });
   });
   return out;
 }
 
-function readReplyTargetStep(thread, prefix) {
-  const re = new RegExp("^" + prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/reply-to-step-(\\d+)$");
-  for (const lbl of thread.getLabels()) {
-    const m = lbl.getName().match(re);
-    if (m) return parseInt(m[1], 10);
-  }
-  return 1;
+function listCleanupCandidates(ctx) {
+  const out = [];
+  const toLabelRe = /^(.+?)\/to\/(.+)$/;
+  ctx.getAllLabels().forEach(function (l) {
+    if (!rootLabelOk(l.getName())) return;
+    const m = l.getName().match(toLabelRe);
+    if (!m) return;
+    if (!recipientReplied(m[1], m[2])) return;
+    const threads = l.getThreads(0, SCAN_LIMIT);
+    threads.forEach(function (t) {
+      if (t.getLabels().some(function (lbl) { return /\/send-after-/.test(lbl.getName()); })) {
+        out.push(m[2] + " (replied) — pending thread " + t.getId());
+      }
+    });
+  });
+  return out;
 }
 
-function extractToFromLabels(thread, prefix) {
-  const re = new RegExp("^" + prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/to/(.+)$");
-  for (const lbl of thread.getLabels()) {
-    const m = lbl.getName().match(re);
+// ─── gif inlining ───────────────────────────────────────────────────────────
+function buildHtmlWithGif(body) {
+  let html = textToHtml(body);
+  const inlineImages = {};
+  if (html.indexOf("[[gif_token]]") === -1) return { htmlBody: html, inlineImages: inlineImages };
+
+  if (GIF_URLS.length === 0) {
+    html = html.replace(/\[\[gif_token\]\]/g, "");
+    return { htmlBody: html, inlineImages: inlineImages };
+  }
+  try {
+    const url = GIF_URLS[Math.floor(Math.random() * GIF_URLS.length)];
+    const blob = UrlFetchApp.fetch(url).getBlob().setName("anim.gif");
+    const cid = "gif" + Date.now();
+    html = html.replace(/\[\[gif_token\]\]/g, '<img src="cid:' + cid + '" alt="">');
+    inlineImages[cid] = blob;
+  } catch (e) {
+    Logger.log("gif inline failed: " + e);
+    html = html.replace(/\[\[gif_token\]\]/g, "");
+  }
+  return { htmlBody: html, inlineImages: inlineImages };
+}
+
+// ─── small helpers ──────────────────────────────────────────────────────────
+function ensureLabel(name) {
+  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
+}
+
+function swapSendAfterToSentAt(thread, prefix, stepNum, dueLabel) {
+  if (dueLabel) thread.removeLabel(dueLabel);
+  const sentLabel = ensureLabel(prefix + "/step-" + stepNum + "/sent-at-" + isoSlug(new Date()));
+  thread.addLabel(sentLabel);
+}
+
+function labelLookup(thread, prefix, marker) {
+  const re = new RegExp(
+    "^" + escapeRe(prefix) + escapeRe(marker) + "(.+)$"
+  );
+  const labels = thread.getLabels();
+  for (let i = 0; i < labels.length; i++) {
+    const m = labels[i].getName().match(re);
     if (m) return m[1];
   }
   return "";
 }
 
-function findParentSentThread(prefix, to, parentStep) {
-  // We labeled all drafts with /to/<email> and /step-N. After sending step N,
-  // the thread holds /sent-at-… for step N. Find a thread with both.
-  const query =
-    'label:"' + prefix + "/to/" + to + '" ' +
-    'label:"' + prefix + "/step-" + parentStep + '"';
-  const threads = GmailApp.search(query, 0, 5);
-  // Prefer threads that already have a sent-at marker (i.e. step N has been promoted).
-  const sentRe = new RegExp("/step-" + parentStep + "/sent-at-");
-  for (const t of threads) {
-    if (t.getLabels().some((l) => sentRe.test(l.getName()))) return t;
+function readReplyTargetStep(thread, prefix) {
+  const re = new RegExp("^" + escapeRe(prefix) + "/reply-to-step-(\\d+)$");
+  const labels = thread.getLabels();
+  for (let i = 0; i < labels.length; i++) {
+    const m = labels[i].getName().match(re);
+    if (m) return parseInt(m[1], 10);
   }
-  return threads[0] || null;
+  return 1;
+}
+
+function findParentSentThread(prefix, to, parentStep) {
+  const q =
+    'label:"' + prefix + '/to/' + to + '" ' +
+    'label:"' + prefix + '/step-' + parentStep + '"';
+  const threads = GmailApp.search(q, 0, 5);
+  const sentRe = new RegExp("/step-" + parentStep + "/sent-at-");
+  for (let i = 0; i < threads.length; i++) {
+    if (threads[i].getLabels().some(function (l) { return sentRe.test(l.getName()); })) {
+      return threads[i];
+    }
+  }
+  return null;
+}
+
+function parseSlugIso(slug) {
+  // "2026-05-20T13-00" → Date
+  const fixed = slug.replace(/^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})$/, "$1:$2:00");
+  const d = new Date(fixed);
+  return isNaN(d.getTime()) ? null : d;
 }
 
 function isoSlug(d) {
-  const pad = (n) => (n < 10 ? "0" + n : "" + n);
+  const pad = function (n) { return n < 10 ? "0" + n : "" + n; };
   return (
     d.getFullYear() +
     "-" + pad(d.getMonth() + 1) +
@@ -204,11 +365,15 @@ function isoSlug(d) {
   );
 }
 
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function textToHtml(text) {
   const esc = text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-  // Preserve the gif token verbatim — we'll swap it after escaping.
+  // [[gif_token]] is preserved verbatim and swapped after we decide CID vs strip.
   return esc.replace(/\n/g, "<br>");
 }
