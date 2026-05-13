@@ -17,7 +17,9 @@ apps-script/        Cron sender: promotes due drafts → sent
 
 1. **Build a sequence** at `/sequences`. Use `{{variable}}` tokens for any per-prospect field. Click *Insert gif token* to drop `[[gif_token]]` at the cursor.
 2. **Start a campaign** at `/campaigns`. Pick the sequence, upload a CSV with one column per `{{var}}` plus an `email` column, pick a start date, **Download manifest.json**.
-3. **Run the worker**: `python worker/draft_writer.py manifest.json` → one labeled Gmail draft per prospect per step.
+3. **Click "Create drafts in Gmail"** — the campaign page POSTs the manifest to `/api/drafts/run`, which auto-creates `worker/.venv` on first call, installs dependencies, and spawns the worker. Output streams back live. Or click **Dry run** to preview without touching Gmail. The button is hidden on the Vercel-hosted deploy because Gmail OAuth needs your local token; run `npm run dev` locally to use it.
+
+   (Equivalent CLI: `python worker/draft_writer.py manifest.json`.)
 4. **Apps Script sender** ticks every 5–15 min, finds drafts whose `send-after-…` time has passed, CID-inlines the gif for `[[gif_token]]`, threads replies, and sends.
 
 ## Variables / CSV

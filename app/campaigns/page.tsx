@@ -1,7 +1,7 @@
 "use client";
 
 import Papa from "papaparse";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   extractVariables,
   loadSequences,
@@ -25,6 +25,21 @@ export default function CampaignsPage() {
     new Date().toISOString().slice(0, 10),
   );
   const [previewIdx, setPreviewIdx] = useState(0);
+  const [hosted, setHosted] = useState<boolean | null>(null);
+  const [running, setRunning] = useState(false);
+  const [log, setLog] = useState<string>("");
+  const logRef = useRef<HTMLPreElement | null>(null);
+
+  useEffect(() => {
+    fetch("/api/drafts/run")
+      .then((r) => r.json())
+      .then((d) => setHosted(Boolean(d.hosted)))
+      .catch(() => setHosted(null));
+  }, []);
+
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [log]);
 
   useEffect(() => {
     const seqs = loadSequences();
@@ -98,6 +113,47 @@ export default function CampaignsPage() {
       generatedAt: new Date().toISOString(),
       drafts,
     };
+  }
+
+  async function runDrafts(dryRun: boolean) {
+    const m = buildManifest();
+    if (!m) return;
+    setRunning(true);
+    setLog("");
+    try {
+      const r = await fetch("/api/drafts/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ manifest: m, dryRun }),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        try {
+          const err = JSON.parse(text);
+          if (err.error === "hosted") {
+            setLog(err.message);
+            return;
+          }
+        } catch {}
+        setLog(text || `HTTP ${r.status}`);
+        return;
+      }
+      const reader = r.body?.getReader();
+      if (!reader) {
+        setLog("(no response body)");
+        return;
+      }
+      const dec = new TextDecoder();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        setLog((prev) => prev + dec.decode(value, { stream: true }));
+      }
+    } catch (e) {
+      setLog((prev) => prev + "\n[client error] " + (e as Error).message);
+    } finally {
+      setRunning(false);
+    }
   }
 
   function downloadManifest() {
@@ -296,20 +352,62 @@ export default function CampaignsPage() {
         </section>
       )}
 
-      <section className="flex items-center gap-3 pt-2 border-t border-neutral-200">
-        <button
-          onClick={downloadManifest}
-          disabled={!ready}
-          className="rounded-md bg-neutral-900 text-white text-sm px-4 py-2 hover:bg-neutral-800 disabled:opacity-40"
-        >
-          Download manifest.json
-        </button>
-        <span className="text-xs text-neutral-500">
-          Then run:{" "}
-          <code className="font-mono bg-neutral-100 px-2 py-0.5 rounded">
-            python worker/draft_writer.py manifest.json
-          </code>
-        </span>
+      <section className="space-y-3 pt-3 border-t border-neutral-200">
+        <div className="flex items-center gap-3 flex-wrap">
+          <button
+            onClick={() => runDrafts(false)}
+            disabled={!ready || running || hosted === true}
+            className="rounded-md bg-emerald-700 text-white text-sm px-4 py-2 hover:bg-emerald-800 disabled:opacity-40"
+            title={
+              hosted === true
+                ? "Hosted on Vercel — run npm run dev locally to use this button"
+                : undefined
+            }
+          >
+            {running ? "Running…" : "Create drafts in Gmail"}
+          </button>
+          <button
+            onClick={() => runDrafts(true)}
+            disabled={!ready || running || hosted === true}
+            className="rounded-md border border-neutral-300 bg-white text-sm px-4 py-2 hover:bg-neutral-100 disabled:opacity-40"
+          >
+            Dry run
+          </button>
+          <button
+            onClick={downloadManifest}
+            disabled={!ready}
+            className="rounded-md border border-neutral-300 bg-white text-sm px-4 py-2 hover:bg-neutral-100 disabled:opacity-40"
+          >
+            Download manifest.json
+          </button>
+          <span className="text-xs text-neutral-500">
+            {hosted === true ? (
+              <>
+                Hosted preview — open{" "}
+                <code className="font-mono">http://localhost:3003</code> to
+                draft into your Gmail.
+              </>
+            ) : hosted === false ? (
+              <>
+                Local mode. The button spawns{" "}
+                <code className="font-mono">
+                  python worker/draft_writer.py
+                </code>
+                .
+              </>
+            ) : (
+              "Detecting environment…"
+            )}
+          </span>
+        </div>
+        {log && (
+          <pre
+            ref={logRef}
+            className="rounded-md border border-neutral-200 bg-neutral-900 text-neutral-100 p-3 text-xs font-mono whitespace-pre-wrap max-h-64 overflow-y-auto"
+          >
+            {log}
+          </pre>
+        )}
       </section>
     </div>
   );
