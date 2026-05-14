@@ -15,6 +15,28 @@ type ParsedCsv = {
   rows: Record<string, string>[];
 };
 
+const DRAFT_KEY = "email-sequencer:campaign-draft:v1";
+
+type CampaignDraft = {
+  sequenceId: string | null;
+  campaignName: string;
+  startDate: string;
+  manualRows: Record<string, string>[];
+};
+
+function SavedAgo({ timestamp }: { timestamp: number }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(id);
+  }, []);
+  const delta = Math.max(0, Math.floor((now - timestamp) / 1000));
+  if (delta < 3) return <span>just now</span>;
+  if (delta < 60) return <span>{delta}s ago</span>;
+  if (delta < 3600) return <span>{Math.floor(delta / 60)}m ago</span>;
+  return <span>{Math.floor(delta / 3600)}h ago</span>;
+}
+
 export default function CampaignsPage() {
   const [sequences, setSequences] = useState<Sequence[]>([]);
   const [sequenceId, setSequenceId] = useState<string | null>(null);
@@ -43,11 +65,59 @@ export default function CampaignsPage() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [log]);
 
+  const [draftLoaded, setDraftLoaded] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
   useEffect(() => {
     const seqs = loadSequences();
     setSequences(seqs);
-    if (seqs.length > 0) setSequenceId(seqs[0].id);
+
+    // Restore the in-progress campaign if there is one. Falls back to first
+    // sequence + today's date for a fresh start.
+    let draft: CampaignDraft | null = null;
+    try {
+      const raw = localStorage.getItem(DRAFT_KEY);
+      if (raw) draft = JSON.parse(raw);
+    } catch {}
+
+    if (draft && seqs.some((s) => s.id === draft!.sequenceId)) {
+      setSequenceId(draft.sequenceId);
+    } else if (seqs.length > 0) {
+      setSequenceId(seqs[0].id);
+    }
+    if (draft) {
+      setCampaignName(draft.campaignName ?? "");
+      if (draft.startDate) setStartDate(draft.startDate);
+      setManualRows(Array.isArray(draft.manualRows) ? draft.manualRows : []);
+    }
+    setDraftLoaded(true);
   }, []);
+
+  // Persist whenever any of the saveable fields changes. Skipped until the
+  // initial load completes so we don't overwrite a real draft with empty state.
+  useEffect(() => {
+    if (!draftLoaded) return;
+    const payload: CampaignDraft = {
+      sequenceId,
+      campaignName,
+      startDate,
+      manualRows,
+    };
+    localStorage.setItem(DRAFT_KEY, JSON.stringify(payload));
+    setSavedAt(Date.now());
+  }, [draftLoaded, sequenceId, campaignName, startDate, manualRows]);
+
+  function resetDraft() {
+    if (!confirm("Clear the saved campaign draft (sequence pick, name, date, manual prospects)?")) return;
+    localStorage.removeItem(DRAFT_KEY);
+    setCampaignName("");
+    setStartDate(new Date().toISOString().slice(0, 10));
+    setManualRows([]);
+    setDraftRow({});
+    setCsv(null);
+    setCsvFileName("");
+    setSavedAt(Date.now());
+  }
 
   const sequence = useMemo(
     () => sequences.find((s) => s.id === sequenceId) ?? null,
@@ -237,11 +307,28 @@ export default function CampaignsPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Campaigns</h1>
-        <p className="text-sm text-neutral-600 mt-1">
-          Pick a sequence, upload a CSV, download the manifest, run the worker.
-        </p>
+      <div className="flex items-start gap-3">
+        <div className="flex-1">
+          <h1 className="text-2xl font-semibold tracking-tight">Campaigns</h1>
+          <p className="text-sm text-neutral-600 mt-1">
+            Pick a sequence, upload a CSV or add prospects by hand, run the worker.
+          </p>
+        </div>
+        <div className="flex flex-col items-end gap-1 pt-1">
+          <span className="text-xs text-neutral-500">
+            {savedAt ? (
+              <>Saved <SavedAgo timestamp={savedAt} /></>
+            ) : (
+              "Saving…"
+            )}
+          </span>
+          <button
+            onClick={resetDraft}
+            className="text-xs px-2 py-0.5 rounded border border-neutral-300 hover:bg-neutral-100"
+          >
+            Reset draft
+          </button>
+        </div>
       </div>
 
       <section className="grid sm:grid-cols-2 gap-4">

@@ -24,14 +24,24 @@
  */
 
 // ─── config ─────────────────────────────────────────────────────────────────
-const TRIGGER_MINUTES = 5;     // cadence
-const LABEL_ROOT      = "seq"; // must match the worker's labelPrefix's first segment
-const SIGNATURE       = "";    // appended after the body, before send. Plain text.
-const SCAN_LIMIT      = 100;   // max threads pulled per label per tick
-// Gif inlining: bodies contain `[[gif:<url>]]` tokens (the worker bakes
-// `{{gif_url}}` from your CSV into that shape). The sender fetches each URL,
-// inlines as CID, and replaces the token with <img src="cid:..."> on send.
+const TRIGGER_MINUTES      = 5;     // cadence
+const LABEL_ROOT           = "seq"; // must match the worker's labelPrefix's first segment
+const SIGNATURE            = "";    // appended after the body, before send. Plain text.
+const SCAN_LIMIT           = 100;   // max threads pulled per label per tick
+
+// Drive-backed gif library (preferred).
+// Drop your gifs into a Drive folder, paste its ID below, and reference them
+// in email bodies as `[[gif:<token>]]` where <token> is the filename without
+// extension, lowercased, non-alnum → `_`. So `Welcome Wave.gif` → `welcome_wave`.
+// Empty string disables the library and falls back to URL-only mode.
+const GIF_FOLDER_ID        = "";    // e.g. "1AbCdEfG..." from drive.google.com/drive/folders/<id>
+const GIF_FOLDER_RECURSIVE = true;
+
+// Tokens that *look* like URLs (http:// or https://) are still fetched directly,
+// so you can mix library tokens and per-prospect URLs in the same campaign.
 // ────────────────────────────────────────────────────────────────────────────
+
+let _gifLibraryCache = null; // tokenName → Drive fileId, memoized per execution
 
 function installTrigger() {
   uninstallTrigger();
@@ -281,11 +291,14 @@ function listCleanupCandidates(ctx) {
 
 // ─── gif inlining ───────────────────────────────────────────────────────────
 //
-// Bodies contain one or more `[[gif:<url>]]` tokens (the worker substitutes
-// {{gif_url}} per prospect). Each one is fetched, attached as inline image
-// with its own CID, and the token is replaced with <img src="cid:...">.
-// Empty URLs and fetch failures are stripped silently — better than leaking
-// `[[gif:]]` text into the email.
+// Bodies contain one or more `[[gif:<value>]]` tokens (the worker substitutes
+// `{{gif_token}}` or `{{gif_url}}` per prospect). Each is resolved to a Blob:
+//   · `<value>` is empty                → token is silently stripped
+//   · `<value>` starts with http(s)://  → fetched via UrlFetchApp
+//   · otherwise                         → looked up in the Drive gif library
+//                                          (filename without extension, slugged)
+// Each resolved blob is attached with its own CID and the token is replaced
+// with <img src="cid:..."> on send.
 function buildHtmlWithGif(body) {
   let html = textToHtml(body);
   const inlineImages = {};
@@ -294,20 +307,91 @@ function buildHtmlWithGif(body) {
   tokenRe.lastIndex = 0;
 
   let i = 0;
-  html = html.replace(tokenRe, function (_match, rawUrl) {
-    const url = rawUrl.trim();
-    if (!url) return "";
+  html = html.replace(tokenRe, function (_match, raw) {
+    const value = (raw || "").trim();
+    if (!value) return "";
     try {
-      const blob = UrlFetchApp.fetch(url).getBlob().setName("anim-" + i + ".gif");
+      const blob = resolveGifBlob_(value);
+      if (!blob) {
+        Logger.log("gif token unresolved: " + value);
+        return "";
+      }
+      blob.setName("anim-" + i + ".gif");
       const cid = "gif" + Date.now() + "_" + (i++);
       inlineImages[cid] = blob;
       return '<img src="cid:' + cid + '" alt="">';
     } catch (e) {
-      Logger.log("gif fetch failed for " + url + ": " + e);
+      Logger.log("gif resolve failed for " + value + ": " + e);
       return "";
     }
   });
   return { htmlBody: html, inlineImages: inlineImages };
+}
+
+// Resolve a `[[gif:<value>]]` value to a Blob. URLs fetch directly; everything
+// else is looked up as a slugged filename in the Drive gif library.
+function resolveGifBlob_(value) {
+  if (/^https?:\/\//i.test(value)) {
+    return UrlFetchApp.fetch(value).getBlob();
+  }
+  const lib = getGifLibrary_();
+  const token = filenameToToken_(value);
+  const fileId = lib[token];
+  if (!fileId) return null;
+  return DriveApp.getFileById(fileId).getBlob();
+}
+
+// ---------- gif placeholder helpers ----------
+
+/**
+ * Returns { tokenName: fileId } map from every image file in the
+ * GIF_FOLDER_ID Drive folder (recursive if GIF_FOLDER_RECURSIVE is on).
+ * Memoized per execution so a hot path doesn't keep re-enumerating.
+ */
+function getGifLibrary_() {
+  if (_gifLibraryCache) return _gifLibraryCache;
+  _gifLibraryCache = {};
+  if (!GIF_FOLDER_ID) return _gifLibraryCache;
+  try {
+    const folder = DriveApp.getFolderById(GIF_FOLDER_ID);
+    addFolderToLibrary_(folder, _gifLibraryCache, GIF_FOLDER_RECURSIVE);
+  } catch (e) {
+    Logger.log("getGifLibrary_: enumeration failed: " + e);
+  }
+  return _gifLibraryCache;
+}
+
+function addFolderToLibrary_(folder, library, recursive) {
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    const file = files.next();
+    if (file.getMimeType().indexOf("image/") !== 0) continue;
+    const token = filenameToToken_(file.getName());
+    if (!token) continue;
+    library[token] = file.getId();
+  }
+  if (recursive) {
+    const subs = folder.getFolders();
+    while (subs.hasNext()) {
+      addFolderToLibrary_(subs.next(), library, true);
+    }
+  }
+}
+
+function filenameToToken_(name) {
+  return String(name || "")
+    .replace(/\.[^.]+$/, "")      // strip extension
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")  // non-alnum → underscore
+    .replace(/^_+|_+$/g, "");     // trim
+}
+
+// Debug helper: log the gif library so you can sanity-check token spellings.
+function listGifLibrary() {
+  const lib = getGifLibrary_();
+  const tokens = Object.keys(lib);
+  Logger.log("gif library: " + tokens.length + " tokens");
+  tokens.sort().forEach(function (t) { Logger.log("  " + t); });
 }
 
 // ─── small helpers ──────────────────────────────────────────────────────────

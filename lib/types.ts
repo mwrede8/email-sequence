@@ -40,11 +40,13 @@ export type Manifest = {
 };
 
 // Token inserted by the "Insert gif" button. After the worker substitutes
-// {{gif_url}} from the CSV, the resulting draft body contains
-// `[[gif:https://example.com/anim.gif]]`. The Apps Script sender matches
-// `\[\[gif:(.+?)\]\]`, fetches that URL, and CID-inlines it on send.
+// {{gif_token}} from the CSV, the resulting draft body contains something like
+// `[[gif:welcome_wave]]`. The Apps Script sender matches `\[\[gif:(.+?)\]\]`,
+// looks the token up in the Drive gif library (filename → slug), and
+// CID-inlines that blob on send. URLs (http(s)://) still work for ad-hoc
+// per-prospect overrides.
 //
 // If you want multiple gif slots in one sequence, change the variable name
-// (e.g. `[[gif:{{gif_url_1}}]]`, `[[gif:{{gif_url_2}}]]`) and add matching
+// (e.g. `[[gif:{{gif_token_1}}]]`, `[[gif:{{gif_token_2}}]]`) and add matching
 // CSV columns.
-export const GIF_TOKEN = "[[gif:{{gif_url}}]]";
+export const GIF_TOKEN = "[[gif:{{gif_token}}]]";
