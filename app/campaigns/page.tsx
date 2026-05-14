@@ -20,6 +20,8 @@ export default function CampaignsPage() {
   const [sequenceId, setSequenceId] = useState<string | null>(null);
   const [csv, setCsv] = useState<ParsedCsv | null>(null);
   const [csvFileName, setCsvFileName] = useState<string>("");
+  const [manualRows, setManualRows] = useState<Record<string, string>[]>([]);
+  const [draftRow, setDraftRow] = useState<Record<string, string>>({});
   const [campaignName, setCampaignName] = useState("");
   const [startDate, setStartDate] = useState<string>(
     new Date().toISOString().slice(0, 10),
@@ -58,11 +60,57 @@ export default function CampaignsPage() {
     return extractVariables(all);
   }, [sequence]);
 
+  // CSV columns missing required tokens. Manual rows always carry every
+  // required column (the form has an input per column), so they don't
+  // contribute to this check.
   const missingColumns = useMemo(() => {
     if (!csv || !sequence) return [];
     const have = new Set(csv.headers.map((h) => h.trim()));
     return ["email", ...requiredVars].filter((v) => !have.has(v));
   }, [csv, sequence, requiredVars]);
+
+  // Merged list of prospects. CSV rows tagged source="csv", manual rows
+  // source="manual" so the table can show where each came from.
+  type SourcedRow = Record<string, string> & {
+    __source: "csv" | "manual";
+    __key: string;
+  };
+  const allRows: SourcedRow[] = useMemo(() => {
+    const csvRows: SourcedRow[] =
+      csv?.rows.map((r, i) => ({
+        ...r,
+        __source: "csv" as const,
+        __key: `csv:${i}:${r.email ?? ""}`,
+      })) ?? [];
+    const manRows: SourcedRow[] = manualRows.map((r, i) => ({
+      ...r,
+      __source: "manual" as const,
+      __key: `manual:${i}:${r.email ?? ""}`,
+    }));
+    return [...csvRows, ...manRows];
+  }, [csv, manualRows]);
+
+  function addManualRow() {
+    if (!draftRow.email || !draftRow.email.trim()) return;
+    const cleaned: Record<string, string> = {};
+    ["email", ...requiredVars].forEach((col) => {
+      cleaned[col] = (draftRow[col] ?? "").trim();
+    });
+    setManualRows((prev) => [...prev, cleaned]);
+    setDraftRow({});
+  }
+
+  function removeRow(row: SourcedRow) {
+    if (row.__source === "manual") {
+      // Find by composite key: we can't trust array index after re-renders.
+      const idx = parseInt(row.__key.split(":")[1] ?? "-1", 10);
+      setManualRows((prev) => prev.filter((_, i) => i !== idx));
+    } else if (csv) {
+      const idx = parseInt(row.__key.split(":")[1] ?? "-1", 10);
+      const nextRows = csv.rows.filter((_, i) => i !== idx);
+      setCsv({ headers: csv.headers, rows: nextRows });
+    }
+  }
 
   function onCsvUpload(file: File) {
     setCsvFileName(file.name);
@@ -80,10 +128,10 @@ export default function CampaignsPage() {
   }
 
   function buildManifest(): Manifest | null {
-    if (!sequence || !csv) return null;
+    if (!sequence || allRows.length === 0) return null;
     const base = new Date(startDate + "T09:00:00");
     const drafts: Manifest["drafts"] = [];
-    csv.rows.forEach((row, rowIdx) => {
+    allRows.forEach((row, rowIdx) => {
       let cumulative = 0;
       sequence.steps.forEach((step, stepIdx) => {
         cumulative += stepIdx === 0 ? 0 : step.delayDays;
@@ -175,8 +223,9 @@ export default function CampaignsPage() {
     URL.revokeObjectURL(a.href);
   }
 
-  const ready = sequence && csv && csv.rows.length > 0 && missingColumns.length === 0;
-  const previewRow = csv?.rows[previewIdx];
+  const ready =
+    !!sequence && allRows.length > 0 && missingColumns.length === 0;
+  const previewRow = allRows[previewIdx];
   const previewDrafts =
     sequence && previewRow
       ? sequence.steps.map((step, i) => {
@@ -254,39 +303,144 @@ export default function CampaignsPage() {
         />
       )}
 
-      <section className="space-y-2">
-        <label className="text-sm font-medium">CSV</label>
-        <input
-          type="file"
-          accept=".csv,text/csv"
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) onCsvUpload(f);
-          }}
-          className="block w-full text-sm file:mr-3 file:rounded file:border-0 file:bg-neutral-900 file:text-white file:px-3 file:py-1.5 file:text-xs"
-        />
-        {csv && (
-          <div className="text-xs text-neutral-600">
-            <code className="font-mono">{csvFileName}</code> · {csv.rows.length}{" "}
-            rows · columns:{" "}
-            {csv.headers.map((h) => (
-              <code
-                key={h}
-                className="font-mono bg-neutral-100 px-1 py-0.5 rounded mr-1"
+      <section className="space-y-3">
+        <label className="text-sm font-medium">Prospects</label>
+
+        <div className="space-y-2">
+          <input
+            type="file"
+            accept=".csv,text/csv"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onCsvUpload(f);
+            }}
+            className="block w-full text-sm file:mr-3 file:rounded file:border-0 file:bg-neutral-900 file:text-white file:px-3 file:py-1.5 file:text-xs"
+          />
+          {csv && (
+            <div className="text-xs text-neutral-600">
+              <code className="font-mono">{csvFileName}</code> ·{" "}
+              {csv.rows.length} rows · columns:{" "}
+              {csv.headers.map((h) => (
+                <code
+                  key={h}
+                  className="font-mono bg-neutral-100 px-1 py-0.5 rounded mr-1"
+                >
+                  {h}
+                </code>
+              ))}
+            </div>
+          )}
+          {csv && missingColumns.length > 0 && (
+            <div className="text-xs text-red-700">
+              Missing columns:{" "}
+              {missingColumns.map((c) => (
+                <code key={c} className="font-mono bg-white px-1 rounded mr-1">
+                  {c}
+                </code>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {sequence && (
+          <details className="rounded-md border border-neutral-200 bg-white p-3" open={manualRows.length > 0 || !csv}>
+            <summary className="text-sm font-medium cursor-pointer select-none">
+              Add a prospect by hand
+              {manualRows.length > 0 && (
+                <span className="ml-2 text-xs text-neutral-500 font-normal">
+                  ({manualRows.length} added)
+                </span>
+              )}
+            </summary>
+            <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {["email", ...requiredVars].map((col) => (
+                <label key={col} className="text-xs text-neutral-700">
+                  <span className="font-mono">{col}</span>
+                  <input
+                    value={draftRow[col] ?? ""}
+                    onChange={(e) =>
+                      setDraftRow((prev) => ({
+                        ...prev,
+                        [col]: e.target.value,
+                      }))
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        addManualRow();
+                      }
+                    }}
+                    placeholder={
+                      col === "email"
+                        ? "alice@example.com"
+                        : col === "gif_url"
+                          ? "https://…"
+                          : ""
+                    }
+                    className="mt-0.5 w-full rounded-md border border-neutral-300 bg-white px-2 py-1.5 text-sm"
+                  />
+                </label>
+              ))}
+            </div>
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={addManualRow}
+                disabled={!draftRow.email || !draftRow.email.trim()}
+                className="text-sm px-3 py-1.5 rounded-md bg-neutral-900 text-white hover:bg-neutral-800 disabled:opacity-40"
               >
-                {h}
-              </code>
-            ))}
-          </div>
+                + Add prospect
+              </button>
+              <span className="text-xs text-neutral-500">
+                Enter in any field also adds.
+              </span>
+            </div>
+          </details>
         )}
-        {csv && missingColumns.length > 0 && (
-          <div className="text-xs text-red-700">
-            Missing columns:{" "}
-            {missingColumns.map((c) => (
-              <code key={c} className="font-mono bg-white px-1 rounded mr-1">
-                {c}
-              </code>
-            ))}
+
+        {allRows.length > 0 && (
+          <div className="rounded-md border border-neutral-200 bg-white overflow-hidden">
+            <div className="px-3 py-2 text-xs font-medium border-b border-neutral-200 bg-neutral-50">
+              {allRows.length} prospect{allRows.length === 1 ? "" : "s"} queued
+              {csv && manualRows.length > 0 && (
+                <span className="text-neutral-500 font-normal">
+                  {" "}
+                  · {csv.rows.length} from CSV + {manualRows.length} manual
+                </span>
+              )}
+            </div>
+            <ul className="divide-y divide-neutral-200 max-h-48 overflow-y-auto">
+              {allRows.map((row) => (
+                <li
+                  key={row.__key}
+                  className="flex items-center gap-2 px-3 py-1.5 text-xs"
+                >
+                  <span className="font-mono">{row.email || "(no email)"}</span>
+                  <span
+                    className={`text-[10px] px-1.5 py-0.5 rounded ${
+                      row.__source === "manual"
+                        ? "bg-purple-100 text-purple-900"
+                        : "bg-neutral-100 text-neutral-700"
+                    }`}
+                  >
+                    {row.__source}
+                  </span>
+                  <span className="ml-auto text-neutral-500 truncate">
+                    {requiredVars
+                      .slice(0, 2)
+                      .map((v) => `${v}=${row[v] || "—"}`)
+                      .join(" · ")}
+                  </span>
+                  <button
+                    onClick={() => removeRow(row)}
+                    className="text-neutral-400 hover:text-red-700"
+                    title="Remove"
+                  >
+                    ✕
+                  </button>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
       </section>
@@ -304,13 +458,13 @@ export default function CampaignsPage() {
                 ←
               </button>
               <span className="font-mono text-neutral-600">
-                {previewIdx + 1} / {csv!.rows.length} · {previewRow.email}
+                {previewIdx + 1} / {allRows.length} · {previewRow.email}
               </span>
               <button
                 onClick={() =>
-                  setPreviewIdx(Math.min(csv!.rows.length - 1, previewIdx + 1))
+                  setPreviewIdx(Math.min(allRows.length - 1, previewIdx + 1))
                 }
-                disabled={previewIdx >= csv!.rows.length - 1}
+                disabled={previewIdx >= allRows.length - 1}
                 className="px-2 py-0.5 rounded border border-neutral-300 hover:bg-neutral-100 disabled:opacity-30"
               >
                 →
